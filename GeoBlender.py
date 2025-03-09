@@ -2,7 +2,7 @@ import taichi as ti
 import numpy as np
 import math
 
-ti.init(arch=ti.gpu,device_memory_GB=4)
+ti.init(arch=ti.gpu)
 vec3 = ti.types.vector(3,ti.f32)
 
 nba_pos = np.load('b_pos.npy')
@@ -13,15 +13,22 @@ r_max = np.max(nba_radi)
 number = nba_pos.shape[0]
 dimension = nba_pos.shape[1]
 
-fixb_pos = np.load('fixb_pos.npy')
-fixb_radi = np.load('fixb_radi.npy')
-fixb_pos -= np.array([0,0,0.2])
-fixb_pos.astype(np.float32)
-fixb_radi.astype(np.float32)
-fix_r_max = np.max(fixb_radi)
-fix_n = fixb_pos.shape[0]
+mixer_pos = np.load('mixer_pos.npy')
+mixer_radi = np.load('mixer_radi.npy')
 
-total_number = number + fix_n
+# Rotate 90° counterclockwise about the X-axis (right-hand rule).
+R_x = np.array([[1,  0,  0], 
+                [0,  0, -1], 
+                [0,  1,  0]])
+
+mixer_pos = mixer_pos @ R_x.T
+mixer_pos -= np.array([0, 0, 0.3])  # shift the fixed balls
+mixer_pos = mixer_pos.astype(np.float32)
+mixer_radi = mixer_radi.astype(np.float32)
+mixer_r_max = np.max(mixer_radi)
+mixer_n = mixer_pos.shape[0]
+
+total_number = number + mixer_n
 
 density = 100
 gkn = 8e3
@@ -56,7 +63,7 @@ class ball:
     ks: ti.f32
 
 bf = ball.field(shape=number)
-fix_bf = ball.field(shape=fix_n)
+mixer_bf = ball.field(shape=mixer_n)
 tot_bf = ball.field(shape=total_number)
 
 @ti.kernel
@@ -71,18 +78,18 @@ def init(pos:ti.types.ndarray(),radi:ti.types.ndarray(),pos2:ti.types.ndarray(),
 
         tot_bf[i] = bf[i]
 
-    for i in fix_bf:
+    for i in mixer_bf:
         for j in ti.static(range(dimension)):
-            fix_bf[i].p[j] = pos2[i,j]
-            fix_bf[i].prep[j] = pos2[i,j]
-        fix_bf[i].r = radi2[i]
-        fix_bf[i].m = density * math.pi * (fix_bf[i].r**3)*4/3
-        fix_bf[i].kn = gkn
+            mixer_bf[i].p[j] = pos2[i,j]
+            mixer_bf[i].prep[j] = pos2[i,j]
+        mixer_bf[i].r = radi2[i]
+        mixer_bf[i].m = density * math.pi * (mixer_bf[i].r**3)*4/3
+        mixer_bf[i].kn = gkn
 
-        tot_bf[i+number] = fix_bf[i]
+        tot_bf[i+number] = mixer_bf[i]
 
 
-init(nba_pos,nba_radi,fixb_pos,fixb_radi)
+init(nba_pos,nba_radi,mixer_pos,mixer_radi)
 
 
 @ti.kernel
@@ -169,7 +176,7 @@ def contact(tbf: ti.template()):
     grain_count.fill(0)
 
     for i in range(total_number):
-        grid_idx = ti.floor((tbf[i].p+0.3)/grid_size, int)
+        grid_idx = int(ti.floor((tbf[i].p+0.3)/grid_size))
         grain_count[grid_idx] += 1
     
     # Contributed by Zhu Zhe (start)
@@ -192,13 +199,13 @@ def contact(tbf: ti.template()):
     # Contributed by Zhu Zhe (end)
 
     for i in range(total_number):
-        grid_idx = ti.floor((tbf[i].p + 0.3) / grid_size, int)
+        grid_idx = int(ti.floor((tbf[i].p + 0.3) / grid_size))
         linear_idx = grid_idx[0]*grid_n*grid_n + grid_idx[1]*grid_n + grid_idx[2]
         grain_location = ti.atomic_add(list_cur[linear_idx],1)
         particle_id[grain_location] = i
 
     for i in range(total_number):
-        grid_idx = ti.floor((tbf[i].p + 0.3) / grid_size, int)
+        grid_idx = int(ti.floor((tbf[i].p + 0.3) / grid_size))
         x_begin = max(grid_idx[0] - 1,0)
         x_end = min(grid_idx[0] + 2, grid_n)
 
@@ -231,21 +238,22 @@ def rotate():
     # spin matrix
     romat = ti.Matrix([[0., 0., 0.], [0., 0., 0.], [0., 0., 0.]], ti.float32)
     _spin = 0.001
+
     romat[0,0] = ti.cos(_spin)
-    romat[2,0] = -ti.sin(_spin)
-    romat[0,2] = ti.sin(_spin)
-    romat[2,2] = ti.cos(_spin)
-    romat[1,1] = 1
-    for i in range(fix_n):
-        fix_bf[i].p[2] += 0.2
-        fix_bf[i].p = romat @ fix_bf[i].p
-        fix_bf[i].p[2] -= 0.2
-        tot_bf[number+i] = fix_bf[i]
+    romat[0,1] = -ti.sin(_spin)
+    romat[1,0] = ti.sin(_spin)
+    romat[1,1] = ti.cos(_spin)
+    romat[2,2] = 1.0
+    for i in range(mixer_n):
+        mixer_bf[i].p[2] += 0.2
+        mixer_bf[i].p = romat @ mixer_bf[i].p
+        mixer_bf[i].p[2] -= 0.2
+        tot_bf[number+i] = mixer_bf[i]
 
 # initial window, canvas, scene, camera
 window = ti.ui.Window("3D GeoBlender",(640,640),show_window=True)
 canvas = window.get_canvas()
-scene = ti.ui.Scene()
+scene = window.get_scene()
 camera = ti.ui.Camera()
 camera.position(1.0,0,0.4)
 camera.lookat(0,0,0)
@@ -286,7 +294,7 @@ while window.running:
     scene.ambient_light((0.3, 0.3, 0.3))
     scene.point_light(pos=(0,0,0.5), color=(1, 1, 1))
     scene.particles(centers=bf.p, per_vertex_color=ball_color , radius=0.00375)
-    scene.particles(centers=fix_bf.p, color=fix_ball_color, radius=0.0009)
+    scene.particles(centers=mixer_bf.p, color=fix_ball_color, radius=0.0009)
     scene.mesh(floor,color=floor_color)
     canvas.scene(scene)
     window.show()
